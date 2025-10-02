@@ -1,0 +1,7 @@
+azure-functions
+azure-storage-blob
+azure-kusto-data
+azure-kusto-ingest
+pandas
+pyodbc
+jsonpath-ng
