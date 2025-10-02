@@ -1,4 +1,3 @@
-#updated code 2.0
 import azure.functions as func
 import json
 import logging
@@ -43,6 +42,8 @@ BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING")
 BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME")
 
 # ADX Configuration
+ADX_CLUSTER_URL = os.getenv("ADX_CLUSTER_URL")
+ADX_DATABASE = os.getenv("ADX_DATABASE")
 ADX_CLIENT_ID = os.getenv("ADX_CLIENT_ID")
 ADX_CLIENT_SECRET = os.getenv("ADX_CLIENT_SECRET")
 ADX_TENANT_ID = os.getenv("ADX_TENANT_ID")
@@ -138,8 +139,8 @@ class ADXManager:
             logging.error(f"Failed to initialize ADX clients: {str(e)}")
             raise
     
-    def create_table_if_not_exists(self, table_name: str, field_mappings: Dict[str, str]) -> bool:
-        """Create ADX table if it doesn't exist with dynamic columns from field mappings"""
+    def create_table_if_not_exists(self, table_name: str, schema_mapping: Dict[str, str]) -> bool:
+        """Create ADX table if it doesn't exist based on schema mapping"""
         try:
             # Check if table exists
             check_query = f".show tables | where TableName == '{table_name}'"
@@ -149,28 +150,24 @@ class ADXManager:
                 # Table doesn't exist, create it
                 columns = []
                 
-                # Extract sink columns from field mappings
-                if field_mappings:
-                    sink_columns = list(field_mappings.values())  # Get target column names
-                    logging.info(f"Found {len(sink_columns)} sink columns from field mappings: {sink_columns}")
-                    
-                    # Create all sink columns as dynamic type
-                    for column_name in sorted(set(sink_columns)):  # Remove duplicates and sort
-                        # Escape column names with special characters or spaces
-                        escaped_column = f"[{column_name}]"
-                        columns.append(f"{escaped_column}: dynamic")
-                else:
-                    # Fallback if no field mappings provided
-                    logging.warning("No field mappings provided, creating default dynamic column")
-                    columns.append("[data]: dynamic")
+                # Add mapped columns
+                for field_name, field_type in schema_mapping.items():
+                    adx_type = self._convert_to_adx_type(field_type)
+                    columns.append(f"[{field_name}]: {adx_type}")
                 
-                # Create table command
-                create_command = f".create table [{table_name}] ({', '.join(columns)})"
+                # # Add standard audit columns
+                # columns.extend([
+                #     "[ingestion_time]: datetime",
+                #     "[site_name]: string",
+                #     "[connector_id]: int",
+                #     "[source_blob]: string"
+                # ])
+                
+                create_command = f".create table ['{table_name}'] ({', '.join(columns)})"
                 logging.info(f"Creating ADX table with command: {create_command}")
                 
-                # Execute table creation
                 self.kusto_client.execute(self.database, create_command)
-                logging.info(f"Successfully created table: {table_name} with {len(columns)} dynamic columns")
+                logging.info(f"Successfully created table: {table_name}")
                 return True
             else:
                 logging.info(f"Table {table_name} already exists")
@@ -180,6 +177,10 @@ class ADXManager:
             logging.error(f"Error creating ADX table {table_name}: {str(e)}")
             return False
     
+    def _convert_to_adx_type(self, sql_type: str) -> str:
+        """Convert SQL Server types to ADX types - always returns dynamic"""
+        return 'dynamic'
+
     def ingest_data(self, table_name: str, data: List[Dict]) -> bool:
         """Ingest data into ADX table using JSON format"""
         try:
@@ -238,24 +239,26 @@ class MappingManager:
                 
                 # Query to get mapping configuration
                 query = """
-                 SELECT 
-                    p.tablename as table_name,
-                    (SELECT 
-                        '{' + STRING_AGG('"' + m.sourcefield + '":"' + m.sinkfield + '"', ',') + '}'
-                     FROM enp_connector_pipeline_mapping m 
-                     WHERE m.pipelineid = p.id
-                    ) as field_mappings
-                FROM enp_connector_pipeline p
-                WHERE p.connectorid = ?
+                SELECT 
+                    table_name,
+                    field_mappings,
+                    schema_definition,
+                    created_date,
+                    updated_date
+                FROM pipeline_mappings 
+                WHERE connector_id = ? AND site_name = ? AND is_active = 1
                 """
                 
-                cursor.execute(query, (connector_id))
+                cursor.execute(query, (connector_id, site_name))
                 result = cursor.fetchone()
                 
                 if result:
                     return {
                         'table_name': result.table_name,
-                        'field_mappings': json.loads(result.field_mappings) if result.field_mappings else {}
+                        'field_mappings': json.loads(result.field_mappings) if result.field_mappings else {},
+                        'schema_definition': json.loads(result.schema_definition) if result.schema_definition else {},
+                        'created_date': result.created_date,
+                        'updated_date': result.updated_date
                     }
                 else:
                     logging.warning(f"No mapping found for connector_id: {connector_id}, site_name: {site_name}")
@@ -316,19 +319,8 @@ class ITDataProcessor:
     
     def __init__(self):
         self.blob_extractor = BlobDataExtractor(BLOB_CONNECTION_STRING, BLOB_CONTAINER_NAME)
+        self.adx_manager = ADXManager(ADX_CLUSTER_URL, ADX_DATABASE, ADX_CLIENT_ID, ADX_CLIENT_SECRET, ADX_TENANT_ID)
         self.mapping_manager = MappingManager(SQL_CONNECTION_STRING)
-        # Note: ADX manager will be initialized dynamically based on site
-        self.adx_manager = None
-    
-    def initialize_adx_manager(self, cluster_url: str, database: str):
-        """Initialize ADX manager with specific cluster and database"""
-        self.adx_manager = ADXManager(
-            cluster_url=cluster_url,
-            database=database,
-            client_id=ADX_CLIENT_ID,
-            client_secret=ADX_CLIENT_SECRET,
-            tenant_id=ADX_TENANT_ID
-        )
     
     def process_pipeline(self, source_blob: str, json_path: str, site_name: str, connector_id: int) -> Dict[str, Any]:
         """Execute complete IT data processing pipeline"""
@@ -365,37 +357,22 @@ class ITDataProcessor:
                 extracted_data, 
                 mapping_config.get('field_mappings', {})
             )
-
-            # Step 4: Connect to appropriate ADX cluster
-            logging.info(f"Step 4: Connecting to ADX cluster for site: {site_name}")
-            try:
-                cnxn = pyodbc.connect(SQL_CONNECTION_STRING)
-                cluster_url, database = connect_to_cluster(site_name, cnxn)
-                cnxn.close()
-                
-                # Initialize ADX manager with the correct cluster and database
-                self.initialize_adx_manager(cluster_url, database)
-                
-            except Exception as e:
-                return {
-                    'status': 'failed',
-                    'error': f'Failed to connect to ADX cluster: {str(e)}',
-                    'records_processed': len(mapped_data)
-                }
             
-            # Step 5: Create/verify ADX table
-            logging.info(f"Step 5: Creating/verifying ADX table")
+            # Step 4: Create/verify ADX table
+            logging.info(f"Step 4: Creating/verifying ADX table")
             table_name = mapping_config['table_name']
+            schema_definition = mapping_config.get('schema_definition', {})
             
-            if not self.adx_manager.create_table_if_not_exists(table_name, mapping_config.get('field_mappings', {})):
+            if not self.adx_manager.create_table_if_not_exists(table_name, schema_definition):
                 return {
                     'status': 'failed',
                     'error': f'Failed to create/verify ADX table: {table_name}',
                     'records_processed': len(mapped_data)
                 }
             
-            # Step 6: Ingest data to ADX
-            logging.info(f"Step 6: Ingesting data to ADX table: {table_name}")
+          
+            # Step 5: Ingest data to ADX
+            logging.info(f"Step 5: Ingesting data to ADX table: {table_name}")
             if not self.adx_manager.ingest_data(table_name, mapped_data):
                 return {
                     'status': 'failed',
@@ -403,15 +380,14 @@ class ITDataProcessor:
                     'records_processed': len(mapped_data)
                 }
 
+            
             return {
                 'status': 'success',
                 'records_processed': len(mapped_data),
                 'table_name': table_name,
                 'site_name': site_name,
                 'connector_id': connector_id,
-                'source_blob': source_blob,
-                'cluster_url': cluster_url,
-                'database': database
+                'source_blob': source_blob
             }
             
         except Exception as e:
@@ -435,29 +411,18 @@ def blob_to_blob_extracted(source_blob: str, json_path_expr: str) -> List[Dict]:
         return []
     
 
-def connect_to_cluster(site_name, cnxn):
-    """
-    Determine which ADX cluster to connect to based on site environment
-    Returns cluster URL and database name
-    """
+def connect_to_cluster(site_name,site_id,df, cnxn):
     sql = "select IsProductionENV from plant_site where AutomationTableName = '" + \
         str(site_name)+"'"
     temp_df = pd.read_sql(sql, cnxn)
-    isprodenv = temp_df['IsProductionENV'][0]   
-    ADX_DATABASE = site_name 
-    
+    isprodenv = temp_df['IsProductionENV'][0]    
     if isprodenv == 1:
         cluster = os.getenv("ADX_CLUSTER_URL_PROD")
-        logging.info(f"Connecting to PRODUCTION ADX cluster for site: {site_name}")
+        ADX_DATABASE = site_name
+        
     else:
         cluster = os.getenv("ADX_CLUSTER_URL_STAG")
-        logging.info(f"Connecting to STAGING ADX cluster for site: {site_name}")
-    
-    if not cluster:
-        env_var = "ADX_CLUSTER_URL_PROD" if isprodenv == 1 else "ADX_CLUSTER_URL_STAG"
-        raise ValueError(f"Environment variable {env_var} is not set")
-    
-    return cluster, ADX_DATABASE
+        ADX_DATABASE = site_name
 
 # # Queue trigger function for IT data processing
 @app.queue_trigger(arg_name="azqueue", queue_name="queuerestapi", connection="QueueConnectionString")
